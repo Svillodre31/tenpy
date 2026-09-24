@@ -472,6 +472,27 @@ class LanczosGroundState(KrylovBased):
             Set this to a number >= 2 if you are short on memory.
             The penalty is that one needs another Lanczos iteration to
             determine the ground state in the end, i.e., runtime is large.
+        target : ``'ground' | 'overlap'``
+            Which Ritz vector of the Krylov space is returned.
+            ``'ground'`` (default) is the standard choice: the lowest Ritz value.
+            ``'overlap'`` selects the Ritz vector with maximal overlap
+            ``|<psi0|v_i>|`` with the starting vector `psi0` ("root following" /
+            maximum-overlap method). Useful to follow a state adiabatically through
+            (quasi-)degenerate manifolds, e.g. topological sectors during flux insertion,
+            instead of relaxing into the sector that is lowest in energy.
+        overlap_window : float
+            Only for ``target='overlap'``: only Ritz vectors with
+            ``E_i - E_min <= overlap_window`` are candidates. Defaults to ``inf``.
+
+    Attributes
+    ----------
+    selected : int
+        Index (in the sorted Ritz spectrum) of the returned Ritz vector in the last iteration.
+    ov_selected, ov_ground : float
+        Overlaps ``|<psi0|v_sel>|`` and ``|<psi0|v_0>|`` of the selected and of the lowest
+        Ritz vector with the starting vector (in the last Krylov step).
+    E_ground_ritz : float
+        Lowest Ritz value in the last step (without `E_shift`).
     """
 
     _dtype_h_krylov = np.float64
@@ -483,6 +504,15 @@ class LanczosGroundState(KrylovBased):
         self.N_cache = self.options.get('N_cache', self.N_max, int)
         if self.N_cache < 2:
             raise ValueError('Need to cache at least two vectors.')
+        self.target = self.options.get('target', 'ground', str)
+        if self.target not in ('ground', 'overlap'):
+            raise ValueError(f"Unknown Lanczos target {self.target!r}, use 'ground' or 'overlap'")
+        self.overlap_window = self.options.get('overlap_window', np.inf, 'real')
+        self._E_sel = np.zeros(self.N_max, dtype=self._dtype_E)
+        self.selected = 0
+        self.ov_selected = 1.0
+        self.ov_ground = 1.0
+        self.E_ground_ritz = None
 
     def run(self):
         """Find the ground state of H.
@@ -498,19 +528,30 @@ class LanczosGroundState(KrylovBased):
 
         """
         N = self._build_krylov()
-        E0 = self.Es[N - 1, 0]
+        E0 = self._E_sel[N - 1]
+        self.E_ground_ritz = self.Es[N - 1, 0]
         if N > 1:
             logger.debug(
                 'Lanczos N=%d, gap=%.3e, DeltaE0=%.3e, _result_krylov[-1]=%.3e',
                 N,
-                self.Es[N - 1, 1] - E0,
-                self.Es[N - 2, 0] - E0,
+                self.Es[N - 1, 1] - self.Es[N - 1, 0],
+                self._E_sel[N - 2] - E0,
                 self._result_krylov[-1],
             )
+            if self.selected != 0:
+                logger.debug(
+                    'Lanczos target=overlap: took Ritz vector %d (E-E_min=%.3e), '
+                    '|<psi0|v_sel>|=%.4f vs |<psi0|v_0>|=%.4f',
+                    self.selected,
+                    E0 - self.E_ground_ritz,
+                    self.ov_selected,
+                    self.ov_ground,
+                )
         else:
             logger.debug('Lanczos N=%d, first alpha=%.3e, beta=%.3e', N, self._h_krylov[0, 0], self._h_krylov[0, 1])
         if self.E_shift is not None:
             E0 -= self.E_shift
+            self.E_ground_ritz -= self.E_shift
         if N == 1:
             return E0, self.psi0.copy(), N  # no better estimate available
         return E0, self._calc_result_full(N), N
@@ -549,11 +590,14 @@ class LanczosGroundState(KrylovBased):
 
     def _converged(self, k):
         v0 = self._result_krylov
-        E = self.Es[k, :]  # current energies
+        E = self.Es[k, : k + 1]  # current energies
+        i = self.selected
         RitzRes = abs(v0[k]) * self._h_krylov[k, k + 1]
-        gap = max(E[1] - E[0], self.min_gap)
+        # gap of the selected Ritz value to the rest of the Ritz spectrum
+        others = np.delete(E, i)
+        gap = max(np.min(np.abs(others - E[i])), self.min_gap)
         P_err = (RitzRes / gap) ** 2
-        Delta_E0 = self.Es[k - 1, 0] - E[0]
+        Delta_E0 = abs(self._E_sel[k - 1] - self._E_sel[k])
         return P_err < self.P_tol and Delta_E0 < self.E_tol
 
     def _rebuild_krylov_for_result_full(self, psif, N_max):
@@ -576,16 +620,37 @@ class LanczosGroundState(KrylovBased):
         # continue in _calc_result_full
 
     def _calc_result_krylov(self, k):
-        """Calculate ground state of _h_krylov[:k+1, :k+1]"""
+        """Calculate the target Ritz vector of _h_krylov[:k+1, :k+1].
+
+        For ``target='ground'`` the ground state, for ``target='overlap'`` the Ritz vector
+        with maximal overlap with the starting vector (see :meth:`_select_ritz`).
+        """
         h = self._h_krylov
         if k == 0:
             self.Es[0, 0] = h[0, 0]
+            self._E_sel[0] = h[0, 0]
+            self.selected = 0
+            self.ov_selected = self.ov_ground = 1.0
             self._result_krylov = np.ones(1, np.float64)
         else:
             # Diagonalize h
             E_kr, v_kr = np.linalg.eigh(h[: k + 1, : k + 1])
             self.Es[k, : k + 1] = E_kr
-            self._result_krylov = v_kr[:, 0]  # ground state of _h_krylov
+            i = self._select_ritz(E_kr, v_kr)
+            self.selected = i
+            self._E_sel[k] = E_kr[i]
+            # psi0 is the first Krylov basis vector => <psi0|v_i> = v_kr[0, i]
+            self.ov_selected = abs(v_kr[0, i])
+            self.ov_ground = abs(v_kr[0, 0])
+            self._result_krylov = v_kr[:, i]
+
+    def _select_ritz(self, E_kr, v_kr):
+        """Index of the Ritz vector to be returned."""
+        if self.target == 'ground':
+            return 0
+        ov = np.abs(v_kr[0, :])
+        ov[E_kr - E_kr[0] > self.overlap_window] = -1.0
+        return int(np.argmax(ov))
 
 
 class LanczosEvolution(LanczosGroundState):

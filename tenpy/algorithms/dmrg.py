@@ -501,6 +501,9 @@ class DMRGEngine(IterativeSweeps):
             'err': [],
             'E_trunc': [],
             'ov_change': [],
+            'ov_change_ground': [],
+            'diag_selected': [],
+            'diag_dE_selected': [],
         }
         self.sweep_stats = {
             'sweep': [],
@@ -600,6 +603,11 @@ class DMRGEngine(IterativeSweeps):
         self.update_stats['E_trunc'].append(E_trunc)
         self.update_stats['N_lanczos'].append(N)
         self.update_stats['ov_change'].append(ov_change)
+        info = getattr(self, '_diag_info', None) or {}
+        self.update_stats['ov_change_ground'].append(info.get('ov_change_ground', ov_change))
+        self.update_stats['diag_selected'].append(info.get('selected', 0))
+        self.update_stats['diag_dE_selected'].append(info.get('dE_selected', 0.0))
+        self._diag_info = None
         self.update_stats['err'].append(err)
         self.update_stats['time'].append(time.time() - self.time0)
         self.trunc_err_list.append(err.eps)
@@ -730,25 +738,45 @@ class DMRGEngine(IterativeSweeps):
 
         """
         N = -1  # (unknown)
+        # target / overlap_window: see :cfg:config:`LanczosGroundState`; also used for ED.
+        target = self.lanczos_params.get('target', 'ground', str)
+        window = self.lanczos_params.get('overlap_window', np.inf, 'real')
+        info = {}
+
+        def _lanczos():
+            lanczos = LanczosGroundState(self.eff_H, theta_guess, self.lanczos_params)
+            E, theta, N = lanczos.run()
+            info['selected'] = lanczos.selected
+            info['ov_change_ground'] = 1.0 - lanczos.ov_ground
+            if lanczos.E_ground_ritz is not None:
+                info['dE_selected'] = E - lanczos.E_ground_ritz
+            return E, theta, N
+
+        def _ed(keep_sector):
+            return full_diag_effH(self.eff_H, theta_guess, keep_sector=keep_sector,
+                                  target=target, overlap_window=window, info=info)
 
         if self.diag_method == 'default':
             # use ED for small matrix dimensions, but lanczos by default
             max_N = self.options.get('max_N_for_ED', 400, int)
             if self.eff_H.N < max_N:
-                E, theta = full_diag_effH(self.eff_H, theta_guess, keep_sector=True)
+                E, theta = _ed(True)
             else:
-                E, theta, N = LanczosGroundState(self.eff_H, theta_guess, self.lanczos_params).run()
+                E, theta, N = _lanczos()
         elif self.diag_method == 'lanczos':
-            E, theta, N = LanczosGroundState(self.eff_H, theta_guess, self.lanczos_params).run()
+            E, theta, N = _lanczos()
         elif self.diag_method == 'arpack':
+            if target != 'ground':
+                raise ValueError("diag_method='arpack' only supports lanczos_params['target']='ground'")
             E, theta = lanczos_arpack(self.eff_H, theta_guess, self.lanczos_params)
         elif self.diag_method == 'ED_block':
-            E, theta = full_diag_effH(self.eff_H, theta_guess, keep_sector=True)
+            E, theta = _ed(True)
         elif self.diag_method == 'ED_all':
-            E, theta = full_diag_effH(self.eff_H, theta_guess, keep_sector=False)
+            E, theta = _ed(False)
         else:
             raise ValueError('Unknown diagonalization method: ' + repr(self.diag_method))
         ov_change = 1.0 - abs(npc.inner(theta_guess, theta, 'labels', do_conj=True))
+        self._diag_info = info
         return E, theta, N, ov_change
 
     def plot_update_stats(self, axes, xaxis='time', yaxis='E', y_exact=None, **kwargs):
@@ -1174,7 +1202,7 @@ def chi_list(chi_max, dchi=20, nsweeps=20):
     return chi_list
 
 
-def full_diag_effH(effH, theta_guess, keep_sector=True):
+def full_diag_effH(effH, theta_guess, keep_sector=True, target='ground', overlap_window=np.inf, info=None):
     """Perform an exact diagonalization of `effH`.
 
     This function offers an alternative to :func:`~tenpy.linalg.lanczos.lanczos`.
@@ -1185,10 +1213,31 @@ def full_diag_effH(effH, theta_guess, keep_sector=True):
         The effective Hamiltonian.
     theta_guess : :class:`~tenpy.linalg.np_conserved.Array`
         Current guess to select the charge sector. Labels as specified by ``effH.acts_on``.
+    keep_sector : bool
+        Whether to diagonalize only in the charge sector of `theta_guess`.
+    target : ``'ground' | 'overlap'``
+        Return the lowest eigenvector (default) or the eigenvector with maximal overlap
+        with `theta_guess` among those with ``E - E_min <= overlap_window``.
+        Same meaning as in :class:`~tenpy.linalg.krylov_based.LanczosGroundState`.
+    overlap_window : float
+        See `target`.
+    info : dict | None
+        If a dict is given, it is filled with the diagnostics ``'selected'``,
+        ``'ov_change_ground'`` and ``'dE_selected'``.
 
     """
     theta_guess = theta_guess.combine_legs(effH.acts_on, qconj=+1)
     fullH = effH.to_matrix()
+
+    def _select(E, ov):
+        if target == 'ground':
+            return 0
+        if target != 'overlap':
+            raise ValueError(f"Unknown target {target!r}, use 'ground' or 'overlap'")
+        ov = np.array(ov, dtype=float)
+        ov[E - E[0] > overlap_window] = -1.0
+        return int(np.argmax(ov))
+
     if keep_sector:
         # diagonalize only the block of the charge sector in which `theta_guess` is.
         leg = theta_guess.legs[0]
@@ -1202,15 +1251,31 @@ def full_diag_effH(effH, theta_guess, keep_sector=True):
             theta = theta_guess
         else:
             E, V = np.linalg.eigh(block)
-            E0 = E[0]
+            g = theta_guess.get_block(np.array([qi], np.intp))
+            if g is None:
+                ov = np.zeros(len(E))
+            else:
+                g = g / max(np.linalg.norm(g), 1.0e-300)
+                ov = np.abs(V.conj().T @ g)
+            i0 = _select(E, ov)
+            E0 = E[i0]
+            if info is not None:
+                info.update(selected=i0, ov_change_ground=1.0 - ov[0], dE_selected=E0 - E[0])
             theta = theta_guess.zeros_like()
             theta.dtype = np.promote_types(fullH.dtype, theta_guess.dtype)
             theta_block = theta.get_block(np.array([qi], np.intp), insert=True)
-            theta_block[:] = V[:, 0]  # copy data into theta
+            theta_block[:] = V[:, i0]  # copy data into theta
     else:  # allow to change charge sector!
         E, V = npc.eigh(fullH)
-        i0 = np.argmin(E)
-        E0 = E[i0]
+        perm = np.argsort(E)
+        E = E[perm]
+        g = theta_guess / max(npc.norm(theta_guess), 1.0e-300)
+        ov = np.abs(npc.tensordot(V.conj(), g, axes=[0, 0]).to_ndarray())[perm]
+        k = _select(E, ov)
+        i0 = perm[k]
+        E0 = E[k]
+        if info is not None:
+            info.update(selected=k, ov_change_ground=1.0 - ov[0], dE_selected=E0 - E[0])
         theta = V.take_slice(i0, 1)
     theta = theta.split_legs([0]).iset_leg_labels(effH.acts_on)
     return E0, theta

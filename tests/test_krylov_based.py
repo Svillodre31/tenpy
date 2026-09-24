@@ -159,3 +159,35 @@ def test_arnoldi(n, which):
     ov = np.inner(psi0.to_ndarray().conj(), psi0_flat)
     print('|<psi0|psi0_flat>|=', abs(ov))
     assert abs(1.0 - abs(ov)) < tol
+
+
+@pytest.mark.parametrize('N_cache', [20, 4])
+def test_lanczos_target_overlap(N_cache, n=30, delta=1.0e-3, eps=0.05):
+    """target='overlap' follows the state closest to psi0 in a quasi-degenerate manifold."""
+    rng = np.random.default_rng(12345)
+    leg = npc.LegCharge.from_trivial(n)
+    # spectrum: two quasi-degenerate low states (splitting delta), then a gap
+    E_exact = np.concatenate([[0.0, delta], 1.0 + np.sort(rng.random(n - 2))])
+    Q, _ = np.linalg.qr(rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n)))
+    H_flat = (Q * E_exact) @ Q.conj().T
+    H = npc.Array.from_ndarray(H_flat, [leg, leg.conj()])
+    # start close to the *excited* member of the doublet
+    v = Q[:, 1] + eps * Q[:, 0] + eps * rng.normal(size=n)
+    psi_init = npc.Array.from_ndarray(v / np.linalg.norm(v), [leg])
+    opts = dict(N_cache=N_cache, N_max=n, P_tol=1.0e-14, reortho=True)
+
+    E_g, psi_g, _ = krylov_based.LanczosGroundState(H, psi_init, dict(opts)).run()
+    assert abs(E_g - E_exact[0]) < 1.0e-10
+    assert abs(abs(np.vdot(Q[:, 0], psi_g.to_ndarray())) - 1.0) < 1.0e-8
+
+    lan = krylov_based.LanczosGroundState(H, psi_init, dict(opts, target='overlap'))
+    E_o, psi_o, _ = lan.run()
+    assert abs(E_o - E_exact[1]) < 1.0e-10
+    assert abs(abs(np.vdot(Q[:, 1], psi_o.to_ndarray())) - 1.0) < 1.0e-8
+    assert lan.selected == 1 and lan.ov_selected > lan.ov_ground
+    assert abs(lan.E_ground_ritz - E_exact[0]) < 1.0e-10
+
+    # a window smaller than the splitting forces the ground state again
+    lan = krylov_based.LanczosGroundState(H, psi_init, dict(opts, target='overlap', overlap_window=0.1 * delta))
+    E_w, _, _ = lan.run()
+    assert abs(E_w - E_exact[0]) < 1.0e-10 and lan.selected == 0
