@@ -344,6 +344,7 @@ class DMRGEngine(IterativeSweeps):
         self.sweep_stats['max_E_trunc'].append(max_E_trunc)
         self.sweep_stats['max_chi'].append(np.max(self.psi.chi))
         self.sweep_stats['norm_err'].append(norm_err)
+        self.sweep_stats['QL'].append(self._log_QL_checkpoint())
 
         return E, self.psi
 
@@ -522,6 +523,7 @@ class DMRGEngine(IterativeSweeps):
             'max_E_trunc': [],
             'max_chi': [],
             'norm_err': [],
+            'QL': [],
         }
 
     def sweep(self, optimize=True, meas_E_trunc=False):
@@ -790,6 +792,34 @@ class DMRGEngine(IterativeSweeps):
         self._diag_info = info
         return E, theta, N, ov_change
 
+    def _log_QL_checkpoint(self):
+        """Average charge left of a bond after each iteration (every `N_sweeps_check` sweeps).
+
+        .. cfg:configoptions :: DMRGEngine
+
+            log_QL_checkpoint : bool
+                If True, compute ``<Q_L>`` (charge left of bond `QL_bond`) from the current
+                Schmidt values after each iteration, ``logger.info`` it and store it in
+                ``sweep_stats['QL']``. Read-only: the state is not modified or canonicalized.
+                Works also while the mixer is active (non-diagonal `S`).
+            QL_bond : int
+                Bond for `log_QL_checkpoint`. Defaults to 0.
+        """
+        if not self.options.get('log_QL_checkpoint', False, bool):
+            return np.nan
+        bond = self.options.get('QL_bond', 0, int)
+        try:
+            QL = _average_charge_any_S(self.psi, bond)
+        except Exception as e:  # diagnostics must never break the run
+            logger.warning('log_QL_checkpoint failed: %r', e)
+            return np.nan
+        logger.info(
+            'QL checkpoint sweep=%d: QL=%.6f (bond %d, mixer %s, chi_max=%d)',
+            self.sweeps, QL, bond,
+            'activo' if self.mixer is not None else 'apagado', np.max(self.psi.chi),
+        )
+        return QL
+
     def _log_diag(self, theta_guess, theta, info, ov_change):
         """Diagnostics of :meth:`diag`: non-ground Ritz choices and charge-sector changes.
 
@@ -810,7 +840,8 @@ class DMRGEngine(IterativeSweeps):
                 lowest Ritz vector (``target='overlap'``). Defaults to True.
         """
         sel = info.get('selected', 0)
-        if sel != 0 and self.options.get('log_non_ground', True, bool):
+        log_non_ground = self.options.get('log_non_ground', True, bool)
+        if sel != 0 and log_non_ground:
             logger.info(
                 'NO FUNDAMENTAL sweep=%d i0=%d: Ritz #%d, E-E0=%.3e, 1-|<g|v_sel>|=%.3e, '
                 '1-|<g|v_0>|=%.3e',
@@ -1267,6 +1298,26 @@ def chi_list(chi_max, dchi=20, nsweeps=20):
     if chi < chi_max:
         chi_list[nsweeps * (i + 1)] = chi_max
     return chi_list
+
+
+def _average_charge_any_S(psi, bond=0):
+    """Like :meth:`~tenpy.networks.mps.MPS.average_charge`, but also for 2D `S` (active mixer).
+
+    For a 2D `S` (labels ``'vL', 'vR'``), the weight of charge sector `q` is the squared
+    Frobenius norm of the blocks of `S` whose ``'vR'`` index has charge `q`, i.e. the trace of
+    the reduced density matrix in that sector (the right part is right-canonical).
+    """
+    S = psi.get_SL(bond)
+    if not isinstance(S, npc.Array):
+        return float(psi.average_charge(bond)[0])
+    col = S.get_leg_index('vR')
+    leg = S.legs[col].conj()  # 'vR' of S contracts with 'vL' of B -> same charges as in average_charge
+    w = {}
+    for qi, block in zip(S._qdata, S._data):
+        q = float(leg.get_charge(qi[col])[0])
+        w[q] = w.get(q, 0.0) + float(np.linalg.norm(block) ** 2)
+    tot = sum(w.values())
+    return sum(q * v for q, v in w.items()) / tot
 
 
 def _charge_weights_left(theta):

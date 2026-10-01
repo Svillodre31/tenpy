@@ -455,3 +455,26 @@ def test_sector_log_weights(combine):
     es = {int(q[0]): np.sum(np.exp(-e)) for q, e in psi.entanglement_spectrum(by_charge=True)[i]}
     for (q,), v in w.items():
         assert abs(v - es[q]) < 1e-10
+
+
+def test_average_charge_any_S_and_log_QL():
+    """<Q_L> from a 2D `S` (active mixer) equals average_charge after mixer cleanup."""
+    from tenpy.algorithms.dmrg import _average_charge_any_S
+    from tenpy.models.spins import SpinChain
+    M = SpinChain({'L': 2, 'S': 0.5, 'conserve': 'Sz', 'bc_MPS': 'infinite', 'Jz': 0.5})
+    psi = mps.MPS.from_product_state(M.lat.mps_sites(), ['up', 'up'], bc='infinite',
+                                     unit_cell_width=M.lat.mps_unit_cell_width)
+    eng = dmrg.TwoSiteDMRGEngine(psi, M, {'trunc_params': {'chi_max': 16}, 'mixer': True,
+                                          'mixer_params': {'amplitude': 1.e-2},
+                                          'log_QL_checkpoint': True, 'max_sweeps': 20})
+    eng.mixer_activate()
+    for _ in range(4):
+        eng.sweep()
+    assert isinstance(eng.psi.get_SL(0), npc.Array)
+    q2 = _average_charge_any_S(eng.psi, 0)
+    eng.mixer_cleanup()
+    assert abs(q2 - eng.psi.average_charge(0)[0]) < 1e-10
+    assert abs(_average_charge_any_S(eng.psi, 0) - eng.psi.average_charge(0)[0]) < 1e-12
+    eng.run()
+    QL = np.array(eng.sweep_stats['QL'], dtype=float)
+    assert len(QL) == len(eng.sweep_stats['sweep']) and np.all(np.isfinite(QL))
