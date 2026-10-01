@@ -431,3 +431,27 @@ def test_segment_dmrg(model):
     with pytest.warns():
         eng0.options.warn_unused()
         eng1.options.warn_unused()
+
+
+@pytest.mark.parametrize('combine', [False, True])
+def test_sector_log_weights(combine):
+    """`_charge_weights_left` reproduces the charge-resolved Schmidt weights; stats are filled."""
+    from tenpy.algorithms.dmrg import _charge_weights_left
+    from tenpy.models.spins import SpinChain
+    M = SpinChain({'L': 8, 'S': 0.5, 'conserve': 'Sz', 'bc_MPS': 'finite'})
+    psi = mps.MPS.from_product_state(M.lat.mps_sites(), ['up', 'down'] * 4, bc='finite',
+                                     unit_cell_width=M.lat.mps_unit_cell_width)
+    eng = dmrg.TwoSiteDMRGEngine(psi, M, {'trunc_params': {'chi_max': 16}, 'max_sweeps': 4,
+                                          'mixer': False, 'sector_log': True, 'combine': combine,
+                                          'sector_change_threshold': 0.05})
+    eng.run()
+    us = eng.update_stats
+    d = np.array(us['sector_dist'], dtype=float)
+    assert len(d) == len(us['i0']) and not np.any(np.isnan(d))
+    assert np.all((d >= 0.) & (d <= 1. + 1e-12))
+    assert len(us['diag_ov_best']) == len(us['i0'])
+    i = 3
+    w = _charge_weights_left(psi.get_theta(i, 2))
+    es = {int(q[0]): np.sum(np.exp(-e)) for q, e in psi.entanglement_spectrum(by_charge=True)[i]}
+    for (q,), v in w.items():
+        assert abs(v - es[q]) < 1e-10

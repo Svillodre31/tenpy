@@ -504,6 +504,10 @@ class DMRGEngine(IterativeSweeps):
             'ov_change_ground': [],
             'diag_selected': [],
             'diag_dE_selected': [],
+            'diag_ov_best': [],
+            'diag_dE_best_ov': [],
+            'sector_dist': [],
+            'sector_q_dom': [],
         }
         self.sweep_stats = {
             'sweep': [],
@@ -607,6 +611,10 @@ class DMRGEngine(IterativeSweeps):
         self.update_stats['ov_change_ground'].append(info.get('ov_change_ground', ov_change))
         self.update_stats['diag_selected'].append(info.get('selected', 0))
         self.update_stats['diag_dE_selected'].append(info.get('dE_selected', 0.0))
+        self.update_stats['diag_ov_best'].append(info.get('ov_best', np.nan))
+        self.update_stats['diag_dE_best_ov'].append(info.get('dE_best_ov', np.nan))
+        self.update_stats['sector_dist'].append(info.get('sector_dist', np.nan))
+        self.update_stats['sector_q_dom'].append(info.get('sector_q_new', np.nan))
         self._diag_info = None
         self.update_stats['err'].append(err)
         self.update_stats['time'].append(time.time() - self.time0)
@@ -750,6 +758,8 @@ class DMRGEngine(IterativeSweeps):
             info['ov_change_ground'] = 1.0 - lanczos.ov_ground
             if lanczos.E_ground_ritz is not None:
                 info['dE_selected'] = E - lanczos.E_ground_ritz
+            info['ov_best'] = lanczos.ov_best
+            info['dE_best_ov'] = lanczos.dE_best_ov
             return E, theta, N
 
         def _ed(keep_sector):
@@ -776,8 +786,65 @@ class DMRGEngine(IterativeSweeps):
         else:
             raise ValueError('Unknown diagonalization method: ' + repr(self.diag_method))
         ov_change = 1.0 - abs(npc.inner(theta_guess, theta, 'labels', do_conj=True))
+        self._log_diag(theta_guess, theta, info, ov_change)
         self._diag_info = info
         return E, theta, N, ov_change
+
+    def _log_diag(self, theta_guess, theta, info, ov_change):
+        """Diagnostics of :meth:`diag`: non-ground Ritz choices and charge-sector changes.
+
+        .. cfg:configoptions :: DMRGEngine
+
+            sector_log : bool
+                If True, compute in every update the charge-resolved Schmidt weights
+                ``p_q = sum_{alpha in q} s_alpha^2`` of the left half (bond between the two sites)
+                for `theta_guess` and for the optimized `theta`, and their distance
+                ``sector_dist = 1/2 sum_q |p_q^new - p_q^old|`` (0: same sector distribution,
+                1: completely different). Stored in ``update_stats['sector_dist']`` and
+                ``update_stats['sector_q_dom']`` (dominant charge after the update).
+            sector_change_threshold : float
+                ``logger.info`` a "CAMBIO DE SECTOR" line if ``sector_dist`` exceeds this value.
+                Defaults to 0.1.
+            log_non_ground : bool
+                ``logger.info`` every update in which the diagonalization did not return the
+                lowest Ritz vector (``target='overlap'``). Defaults to True.
+        """
+        sel = info.get('selected', 0)
+        if sel != 0 and self.options.get('log_non_ground', True, bool):
+            logger.info(
+                'NO FUNDAMENTAL sweep=%d i0=%d: Ritz #%d, E-E0=%.3e, 1-|<g|v_sel>|=%.3e, '
+                '1-|<g|v_0>|=%.3e',
+                self.sweeps, self.i0, sel, info.get('dE_selected', np.nan), ov_change,
+                info.get('ov_change_ground', np.nan),
+            )
+        if not self.options.get('sector_log', False, bool):
+            return
+        thr = self.options.get('sector_change_threshold', 0.1, 'real')
+        try:
+            w_old = _charge_weights_left(theta_guess)
+            w_new = _charge_weights_left(theta)
+        except Exception as e:  # diagnostics must never break the run
+            if not getattr(self, '_sector_log_warned', False):
+                logger.warning('sector_log failed (desactivado en esta actualizacion): %r', e)
+                self._sector_log_warned = True
+            return
+        qs = set(w_old) | set(w_new)
+        dist = 0.5 * sum(abs(w_new.get(q, 0.0) - w_old.get(q, 0.0)) for q in qs)
+        q_old = max(w_old, key=w_old.get)
+        q_new = max(w_new, key=w_new.get)
+        info['sector_dist'] = dist
+        info['sector_q_old'] = q_old[0] if len(q_old) == 1 else q_old
+        info['sector_q_new'] = q_new[0] if len(q_new) == 1 else q_new
+        if dist > thr:  # (no basta con q_old != q_new: con pesos casi iguales el maximo oscila)
+            top = sorted(qs, key=lambda q: -max(w_old.get(q, 0.0), w_new.get(q, 0.0)))[:4]
+            pesos = ', '.join(f'{q}: {w_old.get(q, 0.0):.3f}->{w_new.get(q, 0.0):.3f}' for q in top)
+            logger.info(
+                'CAMBIO DE SECTOR sweep=%d i0=%d: q_dom %s -> %s, dist=%.3f | pesos {%s} | '
+                'Ritz #%d, E-E0=%.3e, mejor overlap del Lanczos %.3f a E-E0=%.3e',
+                self.sweeps, self.i0, q_old, q_new, dist, pesos, info.get('selected', 0),
+                info.get('dE_selected', 0.0), info.get('ov_best', np.nan),
+                info.get('dE_best_ov', np.nan),
+            )
 
     def plot_update_stats(self, axes, xaxis='time', yaxis='E', y_exact=None, **kwargs):
         """Plot :attr:`update_stats` to display the convergence during the sweeps.
@@ -1202,6 +1269,32 @@ def chi_list(chi_max, dchi=20, nsweeps=20):
     return chi_list
 
 
+def _charge_weights_left(theta):
+    """Charge-resolved weights of the left half of a (two-site) wave function `theta`.
+
+    Combines the left legs (``'vL', 'p0'``) and the right legs into a matrix and returns
+    ``{charge_of_left_part: sum |theta_block|^2}``, normalized to 1. This equals
+    ``sum_{alpha in q} s_alpha^2`` of the Schmidt decomposition between the two halves.
+    """
+    labels = theta.get_leg_labels()
+    if len(labels) == 2:  # already combined, e.g. '(vL.p0)', '(p1.vR)' with ``combine=True``
+        th = theta.transpose([labels[0] if 'vL' in labels[0] else labels[1],
+                              labels[1] if 'vL' in labels[0] else labels[0]])
+    else:
+        left = [l for l in labels if l in ('vL', 'p0')]
+        right = [l for l in labels if l not in left]
+        th = theta.combine_legs([left, right], qconj=[+1, -1])
+    leg = th.legs[0]
+    w = {}
+    for qi, block in zip(th._qdata, th._data):
+        q = tuple(int(c) for c in leg.get_charge(qi[0]))
+        w[q] = w.get(q, 0.0) + float(np.linalg.norm(block) ** 2)
+    tot = sum(w.values())
+    if tot > 0:
+        w = {q: v / tot for q, v in w.items()}
+    return w
+
+
 def full_diag_effH(effH, theta_guess, keep_sector=True, target='ground', overlap_window=np.inf, info=None):
     """Perform an exact diagonalization of `effH`.
 
@@ -1260,7 +1353,9 @@ def full_diag_effH(effH, theta_guess, keep_sector=True, target='ground', overlap
             i0 = _select(E, ov)
             E0 = E[i0]
             if info is not None:
-                info.update(selected=i0, ov_change_ground=1.0 - ov[0], dE_selected=E0 - E[0])
+                ib = int(np.argmax(ov))
+                info.update(selected=i0, ov_change_ground=1.0 - ov[0], dE_selected=E0 - E[0],
+                            ov_best=float(ov[ib]), dE_best_ov=float(E[ib] - E[0]))
             theta = theta_guess.zeros_like()
             theta.dtype = np.promote_types(fullH.dtype, theta_guess.dtype)
             theta_block = theta.get_block(np.array([qi], np.intp), insert=True)
@@ -1275,7 +1370,9 @@ def full_diag_effH(effH, theta_guess, keep_sector=True, target='ground', overlap
         i0 = perm[k]
         E0 = E[k]
         if info is not None:
-            info.update(selected=k, ov_change_ground=1.0 - ov[0], dE_selected=E0 - E[0])
+            ib = int(np.argmax(ov))
+            info.update(selected=k, ov_change_ground=1.0 - ov[0], dE_selected=E0 - E[0],
+                        ov_best=float(ov[ib]), dE_best_ov=float(E[ib] - E[0]))
         theta = V.take_slice(i0, 1)
     theta = theta.split_legs([0]).iset_leg_labels(effH.acts_on)
     return E0, theta

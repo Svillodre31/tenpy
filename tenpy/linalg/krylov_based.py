@@ -474,7 +474,7 @@ class LanczosGroundState(KrylovBased):
             determine the ground state in the end, i.e., runtime is large.
         target : ``'ground' | 'overlap'``
             Which Ritz vector of the Krylov space is returned.
-            ``'ground'`` (default) is the standard choice: the lowest Ritz value.
+            ``'ground'`` (default): the lowest Ritz value.
             ``'overlap'`` selects the Ritz vector with maximal overlap
             ``|<psi0|v_i>|`` with the starting vector `psi0` ("root following" /
             maximum-overlap method). Useful to follow a state adiabatically through
@@ -493,6 +493,10 @@ class LanczosGroundState(KrylovBased):
         Ritz vector with the starting vector (in the last Krylov step).
     E_ground_ritz : float
         Lowest Ritz value in the last step (without `E_shift`).
+    ov_best, dE_best_ov : float
+        Largest overlap ``|<psi0|v_i>|`` among *all* Ritz vectors (ignoring `overlap_window`) and
+        its energy above the lowest Ritz value. Useful to calibrate `overlap_window`: the window
+        needed to follow the state is at least `dE_best_ov`.
     """
 
     _dtype_h_krylov = np.float64
@@ -513,6 +517,8 @@ class LanczosGroundState(KrylovBased):
         self.ov_selected = 1.0
         self.ov_ground = 1.0
         self.E_ground_ritz = None
+        self.ov_best = 1.0
+        self.dE_best_ov = 0.0
 
     def run(self):
         """Find the ground state of H.
@@ -630,7 +636,8 @@ class LanczosGroundState(KrylovBased):
             self.Es[0, 0] = h[0, 0]
             self._E_sel[0] = h[0, 0]
             self.selected = 0
-            self.ov_selected = self.ov_ground = 1.0
+            self.ov_selected = self.ov_ground = self.ov_best = 1.0
+            self.dE_best_ov = 0.0
             self._result_krylov = np.ones(1, np.float64)
         else:
             # Diagonalize h
@@ -642,6 +649,9 @@ class LanczosGroundState(KrylovBased):
             # psi0 is the first Krylov basis vector => <psi0|v_i> = v_kr[0, i]
             self.ov_selected = abs(v_kr[0, i])
             self.ov_ground = abs(v_kr[0, 0])
+            i_best = int(np.argmax(np.abs(v_kr[0, :])))  # without energy window
+            self.ov_best = abs(v_kr[0, i_best])
+            self.dE_best_ov = E_kr[i_best] - E_kr[0]
             self._result_krylov = v_kr[:, i]
 
     def _select_ritz(self, E_kr, v_kr):
