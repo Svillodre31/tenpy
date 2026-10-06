@@ -392,13 +392,33 @@ class DMRGEngine(IterativeSweeps):
             max_S_err : float
                 Convergence if the relative change of the entropy in each step
                 satisfies ``|Delta S|/S < max_S_err``
+            max_QL_err : float | None
+                If not None, additionally require that the charge left of the bond `QL_bond`
+                has converged: ``|Delta QL| < max_QL_err`` per sweep, with Delta QL taken
+                from the last two entries of ``sweep_stats['QL']`` (needs
+                ``log_QL_checkpoint=True``). Useful when the energy converges long before
+                the charge sector (slow drift of ``QL``). Defaults to None (not checked).
         """
         max_E_err = self.options.get('max_E_err', 1.0e-8, 'real')
         max_S_err = self.options.get('max_S_err', 1.0e-5, 'real')
+        max_QL_err = self.options.get('max_QL_err', None, 'real')
         E = self.sweep_stats['E'][-1]
         Delta_E = self.sweep_stats['Delta_E'][-1]
         Delta_S = self.sweep_stats['Delta_S'][-1]
-        return abs(Delta_E / max(E, 1.0)) < max_E_err and abs(Delta_S) < max_S_err
+        converged = abs(Delta_E / max(E, 1.0)) < max_E_err and abs(Delta_S) < max_S_err
+        if converged and max_QL_err is not None:
+            QLs = self.sweep_stats.get('QL', [])
+            if len(QLs) < 2 or not (np.isfinite(QLs[-1]) and np.isfinite(QLs[-2])):
+                if not self.options.get('log_QL_checkpoint', False, bool):
+                    logger.warning('max_QL_err needs log_QL_checkpoint=True: ignored')
+                    return converged
+                return False  # not enough QL data yet
+            Delta_QL = (QLs[-1] - QLs[-2]) / self.N_sweeps_check
+            if abs(Delta_QL) >= max_QL_err:
+                logger.info('E and S converged, but Delta QL = %.2e per sweep >= max_QL_err = '
+                            '%.1e: continue', Delta_QL, max_QL_err)
+                return False
+        return converged
 
     def post_run_cleanup(self):
         """Perform any final steps or clean up after the main loop has terminated.

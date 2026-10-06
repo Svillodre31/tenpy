@@ -478,3 +478,31 @@ def test_average_charge_any_S_and_log_QL():
     eng.run()
     QL = np.array(eng.sweep_stats['QL'], dtype=float)
     assert len(QL) == len(eng.sweep_stats['sweep']) and np.all(np.isfinite(QL))
+
+
+def test_max_QL_err():
+    """`max_QL_err` blocks convergence while QL still drifts, and is ignored without QL logging."""
+    from tenpy.models.spins import SpinChain
+    M = SpinChain({'L': 2, 'S': 0.5, 'conserve': 'Sz', 'bc_MPS': 'infinite', 'Jz': 0.5})
+
+    def engine(opts):
+        psi = mps.MPS.from_product_state(M.lat.mps_sites(), ['up', 'down'], bc='infinite',
+                                         unit_cell_width=M.lat.mps_unit_cell_width)
+        base = {'trunc_params': {'chi_max': 16}, 'max_E_err': 1.e-2, 'max_S_err': 1.e-1,
+                'N_sweeps_check': 2}
+        base.update(opts)
+        return dmrg.TwoSiteDMRGEngine(psi, M, base)
+
+    eng = engine({'log_QL_checkpoint': True, 'max_QL_err': 1.e-3})
+    eng.sweep_stats = {'E': [-0.4], 'Delta_E': [0.], 'Delta_S': [0.], 'QL': [0.1, 0.2]}
+    assert not eng.is_converged()          # Delta QL = 0.05 per sweep
+    eng.sweep_stats['QL'] = [0.2, 0.2 + 1.e-4]
+    assert eng.is_converged()              # Delta QL = 5e-5 per sweep
+    eng.sweep_stats['QL'] = [0.2]
+    assert not eng.is_converged()          # not enough data yet
+    eng2 = engine({'max_QL_err': 1.e-3})   # without log_QL_checkpoint: criterion ignored
+    eng2.sweep_stats = {'E': [-0.4], 'Delta_E': [0.], 'Delta_S': [0.], 'QL': [np.nan]}
+    assert eng2.is_converged()
+    eng3 = engine({'log_QL_checkpoint': True, 'max_QL_err': 1.e-6, 'max_sweeps': 30})
+    eng3.run()
+    assert np.isfinite(eng3.sweep_stats['QL'][-1])
