@@ -443,17 +443,51 @@ class VUMPSEngine(IterativeSweeps):
         return zip(i0s, move_right, update_LP_RP)
 
     def prepare_update_local(self):
-        """For each update, we need to rebuild the environments from scratch using the most recent tensors"""
+        """Build the environments for the local update at `self.i0`.
+
+        Options
+        -------
+        .. cfg:configoptions :: VUMPSEngine
+
+            env_update : 'full' | 'incremental'
+                'full' (TeNPy default): solve the transfer-matrix fixed points of the whole unit
+                cell from scratch before *every* local update (2 Arnoldi solves per site).
+                'incremental': solve them only at the first site of each sweep (and, for two-site,
+                also at the last one, where the update wraps around the unit cell); in between,
+                LP is propagated with the already updated AL tensors and RP is taken from the
+                fixed point of the start of the sweep. This is exactly the environment used by
+                'full' except that the boundary fixed points are those of the start of the
+                sweep; at the VUMPS fixed point the two coincide. ~L times fewer Arnoldi solves.
+        """
         i0 = self.i0
         H = self.model.H_MPO
         psi = self.psi
-
-        self.update_env(**{})  # Call this here to update the env guess due to diagonal changes.
-        boundary_env_data, Es, _ = MPOTransferMatrix.find_init_LP_RP(
-            H, self.psi, calc_E=True, guess_init_env_data=self.guess_init_env_data
-        )  # E is already the energy density.
-        self.env = MPOEnvironment(psi, H, psi, **boundary_env_data)
-        self.transfer_matrix_energy = Es
+        L = psi.L
+        mode = self.options.get('env_update', 'full', str)
+        if mode not in ('full', 'incremental'):
+            raise ValueError(f'env_update={mode!r}')
+        i_cell = i0 % L
+        full = (
+            mode == 'full'
+            or not getattr(self, '_env_is_vumps', False)
+            or i_cell == 0
+            or (self.n_optimize == 2 and i_cell == L - 1)
+        )
+        if full:
+            self.update_env(**{})  # Call this here to update the env guess due to diagonal changes.
+            boundary_env_data, Es, _ = MPOTransferMatrix.find_init_LP_RP(
+                H, self.psi, calc_E=True, guess_init_env_data=self.guess_init_env_data
+            )  # E is already the energy density.
+            self.env = MPOEnvironment(psi, H, psi, **boundary_env_data)
+            self.transfer_matrix_energy = Es
+            self._env_is_vumps = True
+        else:
+            # LP(k), k >= i0, were built with AL tensors that have been updated since: rebuild them
+            # from LP(i0-1). RP(k), k < i0-1, contain updated AR tensors and are no longer needed.
+            for k in range(i_cell, L):
+                self.env.del_LP(k)
+            for k in range(0, max(i_cell - 1, 0)):
+                self.env.del_RP(k)
 
         self.make_eff_H()
         theta = self.psi.get_theta(i0, n=self.n_optimize, cutoff=self.S_inv_cutoff)  # n_optimize will be 1
@@ -719,9 +753,28 @@ class TwoSiteVUMPSEngine(VUMPSEngine):
             raise NotImplementedError('DensityMatrixMixer currently only works for unit cells larger than 2')
 
     def update_env(self, **update_data):
-        # Get guesses for the next LP and RP
-        # TODO: Since bond dimension is changing, is there anyway to reuse old envs?
+        """Guess for the boundary environments of the next local update.
+
+        Options
+        -------
+        .. cfg:configoptions :: TwoSiteVUMPSEngine
+
+            reuse_env_guess : bool
+                If True (default), use the environments of the previous local update as initial
+                vector for the Arnoldi solver of the transfer-matrix fixed points. Only the starting
+                vector changes, not the fixed point: if the legs are incompatible (e.g. chi grew on
+                bond 0), :class:`~tenpy.networks.mpo.MPOTransferMatrix` drops the guess.
+                False restores the original behaviour (start from the identity every update).
+        """
         self.guess_init_env_data = None
+        if not self.options.get('reuse_env_guess', True, bool):
+            return
+        try:
+            data = self.env.get_initialization_data()
+        except Exception:  # first update: env was cleared in __init__
+            return
+        if data.get('init_LP') is not None and data.get('init_RP') is not None:
+            self.guess_init_env_data = data
 
     def update_local(self, theta, **kwargs):
         """Perform two-site update on the site ``i0`` and ``i0+1``.
