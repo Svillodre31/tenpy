@@ -262,6 +262,13 @@ class Sweep(Algorithm):
         else:
             cache = self.env.cache  # re-initialize and reuse the cache!
             cache.clear()  # remove old entries which might no longer be valid
+        # [mis-cambios] metodo de inicializacion del entorno infinito: 'iter' (GMRES, el de TeNPy por defecto) o
+        # 'TM' (MPOTransferMatrix). Con 'iter', si GMRES no llega a la tolerancia el entorno puede salir no hermitico
+        # (<theta|H_eff|theta> complejo) y Lanczos se rompe ('poorly conditioned H matrix'). None = sin cambios.
+        env_init_method = self.options.get('env_init_method', None)
+        if env_init_method is not None and not self.psi.finite and 'init_LP' not in init_env_data:
+            init_env_data = dict(init_env_data, force_init_method=env_init_method)
+            logger.info('environment initialization forced to %r', env_init_method)
         self.env = MPOEnvironment(self.psi, H, self.psi, cache=cache, **init_env_data)
 
     def _init_ortho_to_envs(self, orthogonal_to, resume_data):
